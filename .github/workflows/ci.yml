@@ -1,0 +1,33 @@
+name: Cargo Build & Test
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  MongoDbCollection: config
+  MongoDbStr: mongodb://127.0.0.1:27017/test
+
+jobs:
+  build_and_test:
+    name: Rust project - latest
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+#          - beta
+#          - nightly
+        mongodb-version: [ '6.0' ]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Start MongoDB
+        uses: supercharge/mongodb-github-action@1.8.0
+        with:
+          mongodb-version: ${{ matrix.mongodb-version }}
+          mongodb-replica-set: rs1
+#      - run: mongodb --eval "db.serverStatus()"
+      - run: rustup update ${{ matrix.toolchain }} && rustup default ${{ matrix.toolchain }}
+      - run: cargo build --verbose
+      - run: cargo test --verbose
+

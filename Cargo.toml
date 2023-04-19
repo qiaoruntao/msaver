@@ -1,0 +1,23 @@
+[package]
+name = "msaver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+keywords = ["config", "mongodb"]
+description = "A lib for Rust to save or read data from mongodb"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tracing = "0"
+serde = "1"
+mongodb = { version = "2", features = ["bson-chrono-0_4"] }
+chrono = { version = "0", features = ["serde"] }
+anyhow = "1"
+futures = "0"
+rusqlite = { version = "0", features = ["bundled"] }
+serde_json = "1"
+tokio = { version = "1" }
+deadpool-sqlite = "0"
+qrt-log-utils = "0"
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
