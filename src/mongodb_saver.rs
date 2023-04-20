@@ -125,6 +125,8 @@ impl MongodbSaver {
                     self.dirty.store(true, SeqCst);
                 }
             }
+        } else {
+            self.clean_local();
         }
         result
     }
@@ -383,6 +385,15 @@ impl MongodbSaver {
                 }
             }
         }
+    }
+
+    #[instrument(skip_all)]
+    pub async fn vacuum_local(pool: Pool, database: Database) {
+        info!("start to vacuum local");
+        let conn = pool.get().await.unwrap();
+        let batch_data = conn.interact(|conn| {
+            conn.execute_batch("VACUUM;")
+        }).await;
     }
 }
 
