@@ -20,20 +20,21 @@ use qrt_log_utils::tracing::{error, info, instrument};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::task::JoinHandle;
-use tracing::info_span;
+use tracing::{info_span, warn};
 
+#[derive(Clone)]
 pub struct MongodbSaver {
     database: Database,
-    sqlite_pool: Pool,
     dirty: Arc<AtomicBool>,
     cleaning: Arc<AtomicBool>,
+    sqlite_pool: Pool,
 }
 
 #[derive(Debug)]
-struct RowData {
-    id: i32,
-    collection_name: String,
-    data: String,
+pub struct RowData {
+    pub(crate) id: i32,
+    pub(crate) collection_name: String,
+    pub(crate) data: String,
 }
 
 impl MongodbSaver {
@@ -49,9 +50,11 @@ impl MongodbSaver {
         // Get a handle to the deployment.
         let client = Client::with_options(client_options).unwrap();
         let database = client.database(target_database.as_str());
-        // init split database
 
+        // init split database
         let sqlite_path = env::var("TempSqlitePath").unwrap_or("./sqlite_temp.sqlite".into());
+
+        // check if we can open the database, emit error before we really need to insert data
         let sqlite_config = Config::new(&sqlite_path);
         let pool = sqlite_config.create_pool(Runtime::Tokio1).unwrap();
         let conn = pool.get().await.unwrap();
@@ -65,7 +68,6 @@ impl MongodbSaver {
         }).await {
             error!("failed to create table {}",e);
         }
-
         MongodbSaver {
             database,
             sqlite_pool: pool,
@@ -87,18 +89,28 @@ impl MongodbSaver {
             let now = Local::now();
             doc! {"time":now, "data":&result}
         });
-
-        let result = MongodbSaver::save_collection_inner(self.get_collection(collection_name.as_ref()), &document).await;
-        if result.is_ok() {
-            // mongodb connection ok, check if we need to clean sqlite database
-            self.clean_local();
-        } else {
-            // this function is called outside of this module, can save to local now
-            if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
-                self.dirty.store(true, SeqCst);
+        tokio::select! {
+            result = MongodbSaver::save_collection_inner(self.get_collection(collection_name.as_ref()), &document)=>{
+                if result.is_ok() {
+                    // mongodb connection ok, check if we need to clean sqlite database
+                    self.clean_local();
+                } else {
+                    // this function is called outside of this module, can save to local now
+                    if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
+                        self.dirty.store(true, SeqCst);
+                    }
+                }
+                result
+            }
+            _=tokio::time::sleep(Duration::from_secs(10))=>{
+                let msg="mongodb save timeout, write local now";
+                warn!(msg);
+                if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
+                    self.dirty.store(true, SeqCst);
+                }
+                Err(anyhow!(msg))
             }
         }
-        result
     }
 
     #[instrument(skip(self, obj))]
@@ -117,18 +129,37 @@ impl MongodbSaver {
                 .map(|obj| doc! {"time":now, "data":mongodb::bson::to_bson(obj).unwrap()})
                 .collect::<Vec<_>>()
         });
-
-        let result = self.save_collection_inner_batch(collection_name.as_ref(), &documents).await;
-        if result.is_err() {
-            for document in documents {
-                if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
+        tokio::select! {
+            result = self.save_collection_inner_batch(collection_name.as_ref(), &documents)=>{
+                if result.is_err() {
                     self.dirty.store(true, SeqCst);
+                    // TODO: optimize
+                    for document in documents {
+                        let collection_name=collection_name.as_ref().to_string();
+                        let pool=self.sqlite_pool.clone();
+                        tokio::spawn(async move{
+                            MongodbSaver::write_local(pool, collection_name, &document).await
+                        });
+                    }
+                } else {
+                    self.clean_local();
                 }
+                result
             }
-        } else {
-            self.clean_local();
+            _=tokio::time::sleep(Duration::from_secs(10))=>{
+                let msg="mongodb save batch timeout, write local now";
+                warn!(msg);
+                self.dirty.store(true, SeqCst);
+                for document in documents {
+                    let collection_name=collection_name.as_ref().to_string();
+                    let pool=self.sqlite_pool.clone();
+                    tokio::spawn(async move{
+                        MongodbSaver::write_local(pool, collection_name, &document).await
+                    });
+                }
+                Err(anyhow!(msg))
+            }
         }
-        result
     }
 
     #[instrument(skip_all)]
@@ -155,7 +186,6 @@ impl MongodbSaver {
                                 let first_non_duplicate_error = write_errors.iter().find(|write_error| {
                                     write_error.code != 11000
                                 });
-
                                 if let Some(err) = first_non_duplicate_error {
                                     // TODO: inserted_ids is private, cannot access it, we need to retry all documents
                                     info!("contain_non_duplicate_error, first one is {:?}", err);
@@ -236,7 +266,6 @@ impl MongodbSaver {
             }
         }
     }
-
     #[instrument(skip(arc, document))]
     pub async fn write_local<DataType: ?Sized + Serialize>(arc: Pool, collection_name: impl AsRef<str> + Debug, document: &DataType) -> bool {
         let conn = arc.get().await.unwrap();
@@ -388,10 +417,10 @@ impl MongodbSaver {
     }
 
     #[instrument(skip_all)]
-    pub async fn vacuum_local(pool: Pool, database: Database) {
+    pub async fn vacuum_local(pool: Pool, _database: Database) {
         info!("start to vacuum local");
         let conn = pool.get().await.unwrap();
-        let batch_data = conn.interact(|conn| {
+        let _ = conn.interact(|conn| {
             conn.execute_batch("VACUUM;")
         }).await;
     }

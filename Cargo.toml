@@ -19,5 +19,8 @@ serde_json = "1"
 tokio = { version = "1" }
 deadpool-sqlite = "0"
 qrt-log-utils = "0"
+tower-batch = "0"
+tower = { version = "0", features = ["util"] }
+tower-service = "0"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }
