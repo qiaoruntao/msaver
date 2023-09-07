@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::SeqCst;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use chrono::{DateTime, Local};
@@ -16,11 +16,16 @@ use mongodb::error::{BulkWriteFailure, Error, ErrorKind, WriteError, WriteFailur
 use mongodb::error::ErrorKind::BulkWrite;
 use mongodb::options::{ClientOptions, InsertManyOptions, InsertOneOptions, ResolverConfig, WriteConcern};
 use mongodb::results::{InsertManyResult, InsertOneResult};
+use once_cell::sync::OnceCell;
+use qrt_log_utils::global;
+use qrt_log_utils::opentelemetry::KeyValue;
+use qrt_log_utils::opentelemetry::metrics::{Histogram, Unit};
 use qrt_log_utils::tracing::{error, info, instrument};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::task::JoinHandle;
 use tracing::{info_span, warn};
+use tracing::log::trace;
 
 #[derive(Clone)]
 pub struct MongodbSaver {
@@ -66,7 +71,7 @@ impl MongodbSaver {
                 error!("{}", e);
             }
         }).await {
-            error!("failed to create table {}",e);
+            warn!("failed to create table {}",e);
         }
         MongodbSaver {
             database,
@@ -96,7 +101,7 @@ impl MongodbSaver {
                     self.clean_local();
                 } else {
                     // this function is called outside of this module, can save to local now
-                    if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
+                    if MongodbSaver::write_local_inner(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
                         self.dirty.store(true, SeqCst);
                     }
                 }
@@ -105,7 +110,7 @@ impl MongodbSaver {
             _=tokio::time::sleep(Duration::from_secs(10))=>{
                 let msg="mongodb save timeout, write local now";
                 warn!(msg);
-                if MongodbSaver::write_local(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
+                if MongodbSaver::write_local_inner(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
                     self.dirty.store(true, SeqCst);
                 }
                 Err(anyhow!(msg))
@@ -138,7 +143,7 @@ impl MongodbSaver {
                         let collection_name=collection_name.as_ref().to_string();
                         let pool=self.sqlite_pool.clone();
                         tokio::spawn(async move{
-                            MongodbSaver::write_local(pool, collection_name, &document).await
+                            MongodbSaver::write_local_inner(pool, collection_name, &document).await
                         });
                     }
                 } else {
@@ -154,7 +159,7 @@ impl MongodbSaver {
                     let collection_name=collection_name.as_ref().to_string();
                     let pool=self.sqlite_pool.clone();
                     tokio::spawn(async move{
-                        MongodbSaver::write_local(pool, collection_name, &document).await
+                        MongodbSaver::write_local_inner(pool, collection_name, &document).await
                     });
                 }
                 Err(anyhow!(msg))
@@ -163,7 +168,7 @@ impl MongodbSaver {
     }
 
     #[instrument(skip_all)]
-    async fn save_collection_inner_batch(&self, collection_name: impl AsRef<str> + Debug, all_documents: &[Document]) -> anyhow::Result<Option<InsertManyResult>> {
+    pub(crate) async fn save_collection_inner_batch(&self, collection_name: impl AsRef<str> + Debug, all_documents: &[Document]) -> anyhow::Result<Option<InsertManyResult>> {
         let collection: Collection<Document> = self.get_collection(collection_name);
         let insert_options = {
             let mut temp_write_concern = WriteConcern::default();
@@ -210,6 +215,15 @@ impl MongodbSaver {
 
     #[instrument(skip_all)]
     async fn save_collection_inner(collection: Collection<Document>, full_document: &Document) -> anyhow::Result<Option<InsertOneResult>> {
+        static SAVE_DOCUMENT_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
+        let save_document_time = SAVE_DOCUMENT_TIME_INSTANCE.get_or_init(|| {
+            let meter = global::meter("msaver");
+            let histogram = meter.u64_histogram("msaver-save-document-time").with_unit(Unit::new("ms")).init();
+            histogram
+        });
+
+        let start_time = Instant::now();
+
         let insert_one_options = {
             let mut temp_write_concern = WriteConcern::default();
             temp_write_concern.w_timeout = Some(Duration::from_secs(3));
@@ -218,7 +232,7 @@ impl MongodbSaver {
             temp.write_concern = Option::from(temp_write_concern);
             temp
         };
-        match collection.insert_one(full_document, Some(insert_one_options)).await {
+        let result = match collection.insert_one(full_document, Some(insert_one_options)).await {
             Ok(val) => {
                 Ok(Some(val))
             }
@@ -235,7 +249,17 @@ impl MongodbSaver {
                     }
                 }
             }
-        }
+        };
+        let success_mark = if result.is_ok() {
+            "True"
+        } else {
+            "False"
+        };
+        save_document_time.record(start_time.elapsed().as_millis() as u64,
+                                  &[KeyValue::new("collection_name", collection.name().to_string()), KeyValue::new("success", success_mark), KeyValue::new("batch_size", 1)],
+        );
+
+        result
     }
 
     #[instrument(skip(self, pipeline))]
@@ -267,15 +291,26 @@ impl MongodbSaver {
         }
     }
     #[instrument(skip(arc, document))]
-    pub async fn write_local<DataType: ?Sized + Serialize>(arc: Pool, collection_name: impl AsRef<str> + Debug, document: &DataType) -> bool {
+    pub async fn write_local_inner<DataType: ?Sized + Serialize>(arc: Pool, collection_name: impl AsRef<str> + Debug, document: &DataType) -> bool {
+        trace!("write local now");
+        static WRITE_LOCAL_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
+        let write_local_time = WRITE_LOCAL_TIME_INSTANCE.get_or_init(|| {
+            let meter = global::meter("msaver");
+            let histogram = meter.u64_histogram("msaver-write-local-time-ms").with_unit(Unit::new("ms")).init();
+            histogram
+        });
+
+        let start_time = Instant::now();
+
         let conn = arc.get().await.unwrap();
 
+        let data = serde_json::to_string(&document).unwrap();
         let data = RowData {
             id: 0,
             collection_name: collection_name.as_ref().to_string(),
-            data: serde_json::to_string(&document).unwrap(),
+            data,
         };
-        conn.interact(move |conn| {
+        let result = conn.interact(move |conn| {
             match conn.execute(
                 "INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
                 (&data.collection_name, &data.data),
@@ -288,9 +323,21 @@ impl MongodbSaver {
                     false
                 }
             }
-        }).await.unwrap()
+        }).await.unwrap();
+
+        write_local_time.record(start_time.elapsed().as_millis() as u64, &[KeyValue::new("collection_name", collection_name.as_ref().to_string())]);
+
+        result
     }
 
+    #[instrument(skip(self, document))]
+    pub async fn write_local<DataType: ?Sized + Serialize>(&self, collection_name: impl AsRef<str> + Debug, document: &DataType) -> bool {
+        let is_written = MongodbSaver::write_local_inner(self.sqlite_pool.clone(), &collection_name, document).await;
+        if is_written {
+            self.dirty.store(true, SeqCst);
+        }
+        is_written
+    }
     #[instrument(skip(pool))]
     async fn get_sqlite_cnt(pool: Pool) -> Option<u64> {
         let conn = pool.get().await.unwrap();
@@ -451,7 +498,7 @@ mod test {
         let saver_db_str = env::var("MongoDbSaverStr").expect("need saver db str");
         let mongodb_saver = MongodbSaver::init(saver_db_str.as_str()).await;
         // tokio::time::sleep(Duration::from_secs(3600)).await;
-        assert!(MongodbSaver::write_local(mongodb_saver.sqlite_pool.clone(), "aaa", &document).await);
+        assert!(MongodbSaver::write_local_inner(mongodb_saver.sqlite_pool.clone(), "aaa", &document).await);
         let option = mongodb_saver.clean_local();
         assert!(option.is_some());
         let join_handle = option.unwrap();

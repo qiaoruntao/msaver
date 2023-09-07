@@ -1,117 +1,127 @@
-use std::{env, mem};
 use std::collections::HashMap;
+use std::env;
 use std::fmt::Debug;
-use std::future::Future;
-use std::ops::DerefMut;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use mongodb::bson::Document;
+use qrt_log_utils::opentelemetry::KeyValue;
 use rusqlite::{Connection, params};
 use serde::Serialize;
-use tokio::sync::Mutex;
-use tower::util::ServiceExt;
-use tower_batch::{Batch, BatchControl, BoxError};
-use tower_service::Service;
-use tracing::{error, info, info_span, instrument, trace, warn};
+use tokio::task::JoinHandle;
+use tracing::{error, info_span, instrument, trace, warn};
 
 use crate::mongodb_saver::{MongodbSaver, RowData};
 
 pub struct MongodbQueuedSaver {
-    queue: Arc<Mutex<HashMap<String, Arc<Mutex<Batch<FlushService, Document>>>>>>,
-    saver: MongodbSaver,
-}
-
-pub struct FlushService {
-    collection_name: String,
-    docs: Arc<std::sync::Mutex<Vec<Document>>>,
+    queue: Arc<Mutex<HashMap<String, Arc<Flusher>>>>,
     saver: Arc<MongodbSaver>,
+    sqlite_connection: Arc<Mutex<Connection>>,
 }
 
-impl FlushService {
-    pub fn create(collection_name: impl AsRef<str> + Debug, saver: MongodbSaver) -> Self {
-        FlushService {
-            collection_name: collection_name.as_ref().to_string(),
-            docs: Arc::new(std::sync::Mutex::new(Vec::with_capacity(100))),
-            saver: Arc::new(saver),
+pub struct Flusher {
+    collection_name: String,
+    saver: Arc<MongodbSaver>,
+    data_array: Arc<Mutex<Vec<Document>>>,
+    sqlite_connection: Arc<Mutex<Connection>>,
+    max_len: usize,
+    batch_len: usize,
+    flush_handler: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Flusher {
+    pub fn create(collection_name: String, saver: Arc<MongodbSaver>, sqlite_connection: Arc<Mutex<Connection>>, max_len: usize, batch_len: usize) -> Flusher {
+        Flusher {
+            collection_name,
+            max_len,
+            batch_len,
+            saver,
+            sqlite_connection,
+            flush_handler: Default::default(),
+            data_array: Default::default(),
         }
     }
 
-    async fn save_batch_wrap(vec: Vec<Document>, saver: Arc<MongodbSaver>, str: String) -> Result<(), BoxError> {
-        match saver.save_collection_batch(str, vec.as_slice()).await {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(e) => {
-                Err(BoxError::from(e.to_string()))
-            }
-        }
-    }
-}
+    pub async fn flush2remote() {}
 
-impl Service<BatchControl<Document>> for FlushService {
-    type Response = ();
-    type Error = BoxError;
-    type Future = Pin<Box<dyn Future<Output=Result<(), BoxError>> + Send + Sync + 'static>>;
+    pub fn flush2local() {}
 
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-
-    fn call(&mut self, req: BatchControl<Document>) -> Self::Future {
-        match req {
-            BatchControl::Item(doc) => {
-                {
-                    let mut mutex_guard = self.docs.lock().unwrap();
-                    mutex_guard.push(doc);
-                }
-                info!("doc pushed");
-                Box::pin(futures::future::ready(Ok(())))
-            }
-            BatchControl::Flush => {
-                let vec: Vec<Document> = {
-                    let mut mutex_guard = self.docs.lock().unwrap();
-                    mem::replace(mutex_guard.deref_mut(), Vec::<Document>::with_capacity(100))
+    /// handle add new document to write
+    pub async fn add_data(&self, doc: impl Into<Document>) -> bool {
+        let document = doc.into();
+        let current_len = {
+            let mutex_guard = self.data_array.lock().unwrap();
+            mutex_guard.len()
+        };
+        let properties = [KeyValue::new("collection_name", self.collection_name.clone())];
+        if current_len >= self.batch_len {
+            // if batch size is reached, try to spawn write thread first
+            let mut mutex_guard = self.flush_handler.lock().unwrap();
+            // dbg!(mutex_guard.is_none());
+            if mutex_guard.is_none() || mutex_guard.as_ref().unwrap().is_finished() {
+                trace!("spawn write thread now");
+                let batch_data_vec = {
+                    let mut mutex_guard = self.data_array.lock().unwrap();
+                    let mut temp = Vec::with_capacity(self.batch_len);
+                    for _ in 0..self.batch_len {
+                        match mutex_guard.pop() {
+                            None => {
+                                break;
+                            }
+                            Some(v) => {
+                                temp.push(v);
+                            }
+                        }
+                    }
+                    temp
                 };
-                info!("flushed");
-                Box::pin(Self::save_batch_wrap(vec, self.saver.clone(), self.collection_name.clone()))
+                let saver = self.saver.clone();
+                let collection_name = self.collection_name.clone();
+                let handle = tokio::spawn(async move {
+                    match saver.save_collection_batch(&collection_name, &batch_data_vec).await {
+                        Ok(_) => {
+                        }
+                        Err(e) => {
+                            error!("failed to flush to mongodb, collection is {} e={}",collection_name,e);
+                        }
+                    }
+                    trace!("completed");
+                });
+                *mutex_guard = Some(handle);
             }
         }
+        return if current_len >= self.max_len {
+            // queue full, write to local now
+            // {
+            //     let meter = global::meter("msaver");
+            //     let counter = meter.u64_counter("msaver-direct-local-count").init();
+            //     counter.add(1, &properties);
+            // }
+            self.saver.write_local(&self.collection_name, &document).await
+        } else {
+            trace!("push data to queue now");
+            // write to queue now
+            self.data_array.lock().unwrap().push(document);
+            true
+        };
     }
 }
 
-impl Drop for FlushService {
+impl Drop for Flusher {
     fn drop(&mut self) {
-        let docs = self.docs.lock().unwrap();
+        let docs = self.data_array.lock().unwrap();
         if docs.is_empty() {
             trace!("buffer is empty, flush service exits now");
             return;
         }
-        let sqlite_path = env::var("TempSqlitePath").unwrap_or("./sqlite_temp_drop.sqlite".into());
-        let sqlite_connection = match Connection::open(&sqlite_path) {
-            Ok(v) => { Arc::new(v) }
-            Err(e) => {
-                error!("failed to open sqlite database {}", e);
-                return;
-            }
-        };
-        if let Err(e) = sqlite_connection.execute(
-            "CREATE TABLE saved (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_name  TEXT NOT NULL, data  TEXT NOT NULL)",
-            (), // empty list of parameters.
-        ) {
-            warn!("{}", e);
-        }
+        trace!("start to drop {} docs", docs.len());
         for doc in docs.as_slice() {
             let data = RowData {
                 id: 0,
                 collection_name: self.collection_name.clone(),
                 data: serde_json::to_string(&doc).unwrap(),
             };
-            match sqlite_connection.as_ref().execute("INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
-                                                     params![&data.collection_name, &data.data]) {
+            match self.sqlite_connection.lock().unwrap().execute("INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
+                                                                 params![&data.collection_name, &data.data]) {
                 Ok(_) => {}
                 Err(e) => {
                     error!("failed to insert data into local sqlite, e={}",e);
@@ -124,9 +134,24 @@ impl Drop for FlushService {
 
 impl MongodbQueuedSaver {
     pub fn create(saver: MongodbSaver) -> Self {
+        let sqlite_path = env::var("TempSqlitePath").unwrap_or("./sqlite_temp.sqlite".into());
+        let sqlite_connection = match Connection::open(&sqlite_path) {
+            Ok(v) => { Arc::new(Mutex::new(v)) }
+            Err(e) => {
+                panic!("failed to open sqlite database {}", e);
+            }
+        };
+        // make sure table is created
+        if let Err(e) = sqlite_connection.lock().unwrap().execute(
+            "CREATE TABLE saved (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_name  TEXT NOT NULL, data  TEXT NOT NULL)",
+            (), // empty list of parameters.
+        ) {
+            warn!("{}", e);
+        }
         MongodbQueuedSaver {
             queue: Arc::new(Default::default()),
-            saver,
+            saver: Arc::new(saver),
+            sqlite_connection,
         }
     }
 
@@ -141,22 +166,17 @@ impl MongodbQueuedSaver {
             }
         };
         let batch = {
-            let mut mutex_guard = self.queue.lock().await;
-            let arc = mutex_guard.entry(collection_name.as_ref().to_string()).or_insert_with(|| {
+            let mut mutex_guard = self.queue.lock().unwrap();
+            let collection_name = collection_name.as_ref().to_string();
+            let arc = mutex_guard.entry(collection_name.clone()).or_insert_with(|| {
                 trace!("init flush service now");
-                let flush_service = FlushService::create(collection_name, self.saver.clone());
-                let batch: Batch<FlushService, Document> = Batch::new(flush_service, 100, Duration::from_secs(3));
-                Arc::new(Mutex::new(batch))
-            }).clone();
-            arc
+                let flusher = Flusher::create(collection_name, self.saver.clone(), self.sqlite_connection.clone(), 5000, 100);
+                Arc::new(flusher)
+            });
+            arc.clone()
         };
 
-        let mut guard = batch.lock().await;
-        let batch_guard = guard.deref_mut();
-        let flush_service_batch = batch_guard.ready().await.unwrap();
-        // flush_service_batch.map_request()
-        tokio::spawn(flush_service_batch.call(document));
-        true
+        batch.add_data(document).await
     }
 }
 
@@ -183,13 +203,21 @@ mod test {
         let saver_db_str = env::var("MongoDbSaverStr").expect("need saver db str");
         let mongodb_saver = MongodbSaver::init(saver_db_str.as_str()).await;
         let queued_saver = MongodbQueuedSaver::create(mongodb_saver);
-        for index in 0..1000 {
+        for index in 0..10 {
             let now = chrono::Local::now();
             let result = queued_saver.save_collection("aaa", &doc! {"time":now, "data":&index}).await;
             assert!(result, "failed to insert value")
         }
+        for _ in 0..10 {
+            for index in 0..100 {
+                let now = chrono::Local::now();
+                let result = queued_saver.save_collection("aaa", &doc! {"time":now, "data":&index}).await;
+                assert!(result, "failed to insert value")
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
 
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
     }
 
     // TODO: drop is not necessary since not all messages are sent to flush service
