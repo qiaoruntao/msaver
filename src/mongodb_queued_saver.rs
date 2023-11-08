@@ -52,7 +52,7 @@ impl Flusher {
             let mutex_guard = self.data_array.lock().unwrap();
             mutex_guard.len()
         };
-        let properties = [KeyValue::new("collection_name", self.collection_name.clone())];
+        // let properties = [KeyValue::new("collection_name", self.collection_name.clone())];
         if current_len >= self.batch_len {
             // if batch size is reached, try to spawn write thread first
             let mut mutex_guard = self.flush_handler.lock().unwrap();

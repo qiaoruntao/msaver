@@ -15,11 +15,11 @@ use mongodb::bson::{doc, Document};
 use mongodb::error::{BulkWriteFailure, Error, ErrorKind, WriteError, WriteFailure};
 use mongodb::error::ErrorKind::BulkWrite;
 use mongodb::options::{ClientOptions, InsertManyOptions, InsertOneOptions, ResolverConfig, WriteConcern};
-use mongodb::results::{InsertManyResult, InsertOneResult};
+use mongodb::results::InsertOneResult;
 use once_cell::sync::OnceCell;
 use qrt_log_utils::global;
 use qrt_log_utils::opentelemetry::KeyValue;
-use qrt_log_utils::opentelemetry::metrics::{Histogram, Unit};
+use qrt_log_utils::opentelemetry::metrics::{Counter, Histogram, Unit};
 use qrt_log_utils::tracing::{error, info, instrument};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -41,6 +41,14 @@ pub struct RowData {
     pub(crate) collection_name: String,
     pub(crate) data: String,
 }
+
+#[derive(Debug)]
+pub struct BatchSaveResult {
+    pub failed_index_list: Vec<usize>,
+}
+
+static SAVE_DOCUMENT_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
+static SAVE_DOCUMENT_CNT_INSTANCE: OnceCell<Counter<u64>> = OnceCell::new();
 
 impl MongodbSaver {
     #[instrument]
@@ -68,10 +76,13 @@ impl MongodbSaver {
                 "CREATE TABLE saved (id INTEGER PRIMARY KEY AUTOINCREMENT, collection_name  TEXT NOT NULL, data  TEXT NOT NULL)",
                 (), // empty list of parameters.
             ) {
-                error!("{}", e);
+                error!("failed to create table {}", e);
+            }
+            if let Err(e) = conn.execute_batch("PRAGMA journal_mode=WAL") {
+                error!("setting wal {}", e);
             }
         }).await {
-            warn!("failed to create table {}",e);
+            warn!("failed to init sqlite {}",e);
         }
         MongodbSaver {
             database,
@@ -96,10 +107,7 @@ impl MongodbSaver {
         });
         tokio::select! {
             result = MongodbSaver::save_collection_inner(self.get_collection(collection_name.as_ref()), &document)=>{
-                if result.is_ok() {
-                    // mongodb connection ok, check if we need to clean sqlite database
-                    self.clean_local();
-                } else {
+                if result.is_err() {
                     // this function is called outside of this module, can save to local now
                     if MongodbSaver::write_local_inner(self.sqlite_pool.clone(), collection_name.as_ref(), &document).await {
                         self.dirty.store(true, SeqCst);
@@ -126,7 +134,7 @@ impl MongodbSaver {
     }
 
     #[instrument(skip(self, objs), fields(cnt = objs.len()))]
-    pub async fn save_collection_batch<T: Serialize>(&self, collection_name: impl AsRef<str> + Debug, objs: &[T]) -> anyhow::Result<Option<InsertManyResult>> {
+    pub async fn save_collection_batch<T: Serialize>(&self, collection_name: impl AsRef<str> + Debug, objs: &[T]) -> anyhow::Result<BatchSaveResult> {
         let now = Local::now();
         let documents = info_span!("batch_serialize_part").in_scope(|| {
             objs.iter()
@@ -136,18 +144,24 @@ impl MongodbSaver {
         });
         tokio::select! {
             result = self.save_collection_inner_batch(collection_name.as_ref(), &documents)=>{
-                if result.is_err() {
-                    self.dirty.store(true, SeqCst);
-                    // TODO: optimize
-                    for document in documents {
-                        let collection_name=collection_name.as_ref().to_string();
-                        let pool=self.sqlite_pool.clone();
-                        tokio::spawn(async move{
-                            MongodbSaver::write_local_inner(pool, collection_name, &document).await
-                        });
+                let arr=match &result{
+                    Ok(batch_result)=>{
+                        documents.into_iter().enumerate()
+                        .filter(|(index, _doc)|batch_result.failed_index_list.contains(&index))
+                        .map(|(_,doc)|doc)
+                        .collect::<Vec<_>>()
                     }
-                } else {
-                    self.clean_local();
+                    Err(_)=>{
+                        documents
+                    }
+                };
+                if !arr.is_empty() {
+                    self.dirty.store(true, SeqCst);
+                    let collection_name=collection_name.as_ref().to_string();
+                    let pool=self.sqlite_pool.clone();
+                    tokio::spawn(async move{
+                        MongodbSaver::write_local_batch_inner(pool, collection_name, &arr.iter().map(|v|v).collect::<Vec<_>>()).await
+                    });
                 }
                 result
             }
@@ -155,20 +169,20 @@ impl MongodbSaver {
                 let msg="mongodb save batch timeout, write local now";
                 warn!(msg);
                 self.dirty.store(true, SeqCst);
-                for document in documents {
                     let collection_name=collection_name.as_ref().to_string();
                     let pool=self.sqlite_pool.clone();
                     tokio::spawn(async move{
-                        MongodbSaver::write_local_inner(pool, collection_name, &document).await
+                        MongodbSaver::write_local_batch_inner(pool, collection_name, &documents.iter().map(|v|v).collect::<Vec<_>>()).await
                     });
-                }
                 Err(anyhow!(msg))
             }
         }
     }
 
     #[instrument(skip_all)]
-    pub(crate) async fn save_collection_inner_batch(&self, collection_name: impl AsRef<str> + Debug, all_documents: &[Document]) -> anyhow::Result<Option<InsertManyResult>> {
+    pub(crate) async fn save_collection_inner_batch(&self, collection_name: impl AsRef<str> + Debug, all_documents: &[Document]) -> anyhow::Result<BatchSaveResult> {
+        let start_time = Instant::now();
+
         let collection: Collection<Document> = self.get_collection(collection_name);
         let insert_options = {
             let mut temp_write_concern = WriteConcern::default();
@@ -178,9 +192,9 @@ impl MongodbSaver {
             temp.ordered = Some(false);
             temp
         };
-        match collection.insert_many(all_documents, Some(insert_options)).await {
-            Ok(val) => {
-                Ok(Some(val))
+        let result = match collection.insert_many(all_documents, Some(insert_options)).await {
+            Ok(_) => {
+                Ok(BatchSaveResult { failed_index_list: vec![] })
             }
             Err(e) => {
                 match &e {
@@ -188,17 +202,13 @@ impl MongodbSaver {
                         match kind.as_ref() {
                             BulkWrite(BulkWriteFailure { write_errors: Some(write_errors), .. }) => {
                                 // we are not sure which document cause the error(though message will contain the detail message ), so we need to retry every failed documents
-                                let first_non_duplicate_error = write_errors.iter().find(|write_error| {
-                                    write_error.code != 11000
-                                });
-                                if let Some(err) = first_non_duplicate_error {
-                                    // TODO: inserted_ids is private, cannot access it, we need to retry all documents
-                                    info!("contain_non_duplicate_error, first one is {:?}", err);
-                                    Err(e.into())
-                                } else {
-                                    // otherwise ignore error
-                                    Ok(None)
-                                }
+                                let failed_index_list = write_errors.iter()
+                                    .filter(|write_error| {
+                                        write_error.code != 11000
+                                    })
+                                    .map(|write_error| write_error.index)
+                                    .collect::<Vec<_>>();
+                                Ok(BatchSaveResult { failed_index_list })
                             }
                             _ => {
                                 Err(e.into())
@@ -210,18 +220,23 @@ impl MongodbSaver {
                     }
                 }
             }
-        }
+        };
+        let success_mark = if result.is_ok() {
+            "True"
+        } else {
+            "False"
+        };
+        let save_document_time = Self::get_save_document_time_histogram();
+        let save_document_cnt = Self::get_save_document_cnt_counter();
+        let size = all_documents.len() as u64;
+        let attributes = [KeyValue::new("collection_name", collection.name().to_string()), KeyValue::new("success", success_mark), KeyValue::new("batch_size", size.to_string())];
+        save_document_time.record(start_time.elapsed().as_millis() as u64, &attributes);
+        save_document_cnt.add(size, &attributes);
+        result
     }
 
     #[instrument(skip_all)]
     async fn save_collection_inner(collection: Collection<Document>, full_document: &Document) -> anyhow::Result<Option<InsertOneResult>> {
-        static SAVE_DOCUMENT_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
-        let save_document_time = SAVE_DOCUMENT_TIME_INSTANCE.get_or_init(|| {
-            let meter = global::meter("msaver");
-            let histogram = meter.u64_histogram("msaver-save-document-time").with_unit(Unit::new("ms")).init();
-            histogram
-        });
-
         let start_time = Instant::now();
 
         let insert_one_options = {
@@ -255,11 +270,28 @@ impl MongodbSaver {
         } else {
             "False"
         };
-        save_document_time.record(start_time.elapsed().as_millis() as u64,
-                                  &[KeyValue::new("collection_name", collection.name().to_string()), KeyValue::new("success", success_mark), KeyValue::new("batch_size", 1)],
-        );
-
+        let save_document_time = Self::get_save_document_time_histogram();
+        let save_document_cnt = Self::get_save_document_cnt_counter();
+        let attributes = [KeyValue::new("collection_name", collection.name().to_string()), KeyValue::new("success", success_mark), KeyValue::new("batch_size", 1)];
+        save_document_time.record(start_time.elapsed().as_millis() as u64, &attributes);
+        save_document_cnt.add(1, &attributes);
         result
+    }
+
+    fn get_save_document_cnt_counter() -> &'static Counter<u64> {
+        SAVE_DOCUMENT_CNT_INSTANCE.get_or_init(|| {
+            let meter = global::meter("msaver");
+            let histogram = meter.u64_counter("msaver-save-document-time").with_unit(Unit::new("ms")).init();
+            histogram
+        })
+    }
+
+    fn get_save_document_time_histogram() -> &'static Histogram<u64> {
+        SAVE_DOCUMENT_TIME_INSTANCE.get_or_init(|| {
+            let meter = global::meter("msaver");
+            let histogram = meter.u64_histogram("msaver-save-document-time").with_unit(Unit::new("ms")).init();
+            histogram
+        })
     }
 
     #[instrument(skip(self, pipeline))]
@@ -292,7 +324,11 @@ impl MongodbSaver {
     }
     #[instrument(skip(arc, document))]
     pub async fn write_local_inner<DataType: ?Sized + Serialize>(arc: Pool, collection_name: impl AsRef<str> + Debug, document: &DataType) -> bool {
-        trace!("write local now");
+        MongodbSaver::write_local_batch_inner(arc, collection_name, &[&document]).await
+    }
+    #[instrument(skip(arc, array))]
+    pub async fn write_local_batch_inner<DataType: ?Sized + Serialize>(arc: Pool, collection_name: impl AsRef<str> + Debug, array: &[&DataType]) -> bool {
+        trace!("write local batch now");
         static WRITE_LOCAL_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
         let write_local_time = WRITE_LOCAL_TIME_INSTANCE.get_or_init(|| {
             let meter = global::meter("msaver");
@@ -303,26 +339,37 @@ impl MongodbSaver {
         let start_time = Instant::now();
 
         let conn = arc.get().await.unwrap();
+        let vec = array.iter()
+            .map(|data_element| {
+                let data = serde_json::to_string(&data_element).unwrap();
+                RowData {
+                    id: 0,
+                    collection_name: collection_name.as_ref().to_string(),
+                    data,
+                }
+            })
+            .collect::<Vec<_>>();
 
-        let data = serde_json::to_string(&document).unwrap();
-        let data = RowData {
-            id: 0,
-            collection_name: collection_name.as_ref().to_string(),
-            data,
-        };
         let result = conn.interact(move |conn| {
-            match conn.execute(
-                "INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
-                (&data.collection_name, &data.data),
-            ) {
-                Ok(_) => {
-                    true
+            let mut stmt = match conn.prepare("INSERT INTO saved (collection_name, data) VALUES (?1, ?2)") {
+                Ok(v) => {
+                    v
                 }
                 Err(e) => {
                     error!("{}", e);
-                    false
+                    return false;
+                }
+            };
+            for row_data in vec {
+                match stmt.execute((&row_data.collection_name, &row_data.data)) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("failed to insert by stmt {}", e);
+                        return false;
+                    }
                 }
             }
+            true
         }).await.unwrap();
 
         write_local_time.record(start_time.elapsed().as_millis() as u64, &[KeyValue::new("collection_name", collection_name.as_ref().to_string())]);
@@ -340,6 +387,7 @@ impl MongodbSaver {
     }
     #[instrument(skip(pool))]
     async fn get_sqlite_cnt(pool: Pool) -> Option<u64> {
+        info!("start to get_sqlite_cnt");
         let conn = pool.get().await.unwrap();
         conn.interact(|conn| {
             match conn.query_row_and_then(
@@ -348,10 +396,11 @@ impl MongodbSaver {
                 |row| row.get(0),
             ) {
                 Err(e) => {
-                    error!("{}",e);
+                    error!("failed to get sqlite cnt {}",e);
                     None
                 }
                 Ok(cnt) => {
+                    info!("sqlite cnt is {}", cnt);
                     Some(cnt)
                 }
             }
@@ -377,26 +426,35 @@ impl MongodbSaver {
         let pool = self.sqlite_pool.clone();
 
         let join_handle = tokio::spawn(async move {
-            let total_cnt = MongodbSaver::get_sqlite_cnt(pool.clone()).await.unwrap_or(0);
-            if total_cnt == 0 {
-                return;
-            }
-            for _ in 0..=(total_cnt / 100) {
-                MongodbSaver::pop_local(pool.clone(), database.clone()).await;
-                let total_cnt = MongodbSaver::get_sqlite_cnt(pool.clone()).await;
-                if let Some(0) = total_cnt {
-                    info!("dirty cleaned up");
-                    dirty.store(false, SeqCst);
-                    break;
+            loop {
+                let total_cnt = MongodbSaver::get_sqlite_cnt(pool.clone()).await.unwrap_or(0);
+                if total_cnt == 0 {
+                    info!("already cleaned up");
+                    return;
                 }
+                info!("total cnt is {}", total_cnt);
+                for _ in 0..=((total_cnt / 100) + 1) {
+                    let handled_cnt = match MongodbSaver::pop_local(pool.clone(), database.clone()).await {
+                        Ok(v) => { v }
+                        Err(_) => {
+                            break;
+                        }
+                    };
+                    if handled_cnt == 0 {
+                        info!("dirty cleaned up");
+                        dirty.store(false, SeqCst);
+                        MongodbSaver::vacuum_local(pool.clone(), database.clone()).await;
+                        break;
+                    }
+                }
+                cleaning.store(false, SeqCst);
             }
-            cleaning.store(false, SeqCst);
         });
         Some(join_handle)
     }
 
     #[instrument(skip_all)]
-    pub async fn pop_local(pool: Pool, database: Database) {
+    pub async fn pop_local(pool: Pool, database: Database) -> Result<usize, String> {
         info!("start to pop local");
         let conn = pool.get().await.unwrap();
         let batch_data = conn.interact(|conn| {
@@ -427,7 +485,12 @@ impl MongodbSaver {
                 }).collect::<Vec<_>>();
             cursor
         }).await.unwrap();
-        info!("start to save {} records into mongodb",  batch_data.len());
+        let len = batch_data.len();
+        if len == 0 {
+            return Ok(len);
+        }
+        info!("start to save {} records into mongodb",  len);
+        // TODO: optimize
         for row_data in batch_data.into_iter() {
             let data = row_data.data;
             let collection_name = row_data.collection_name;
@@ -447,20 +510,21 @@ impl MongodbSaver {
                                 // info!("deleted");
                             }
                             Err(e) => {
-                                error!("{}", e);
+                                error!("failed to remove sqlite record {}", e);
                             }
                         }
                     }).await {
-                        error!("{}",e);
+                        error!("failed to get sqlite connection {}",e);
                     }
                 }
                 Err(e) => {
                     // something went wrong
                     error!("failed to save into mongodb {}",e);
-                    break;
+                    return Err("failed to save local record".to_string());
                 }
             }
         }
+        Ok(len)
     }
 
     #[instrument(skip_all)]
