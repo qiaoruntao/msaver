@@ -187,7 +187,7 @@ mod test {
     use std::time::Duration;
 
     use mongodb::bson::doc;
-    use qrt_log_utils::init_logger;
+    use qrt_log_utils::{init_logger, LoggerConfig};
     use serde::Serialize;
 
     use crate::mongodb_queued_saver::MongodbQueuedSaver;
@@ -223,7 +223,7 @@ mod test {
     // TODO: drop is not necessary since not all messages are sent to flush service
     #[tokio::test]
     async fn test_drop() {
-        init_logger("test_drop", None);
+        init_logger("test_drop", LoggerConfig::default());
         let saver_db_str = env::var("MongoDbSaverStr").expect("need saver db str");
         let mongodb_saver = MongodbSaver::init(saver_db_str.as_str()).await;
         let queued_saver = MongodbQueuedSaver::create(mongodb_saver);

@@ -17,15 +17,13 @@ use mongodb::error::ErrorKind::BulkWrite;
 use mongodb::options::{ClientOptions, InsertManyOptions, InsertOneOptions, ResolverConfig, WriteConcern};
 use mongodb::results::InsertOneResult;
 use once_cell::sync::OnceCell;
-use qrt_log_utils::global;
-use qrt_log_utils::opentelemetry::KeyValue;
-use qrt_log_utils::opentelemetry::metrics::{Counter, Histogram, Unit};
+use qrt_log_utils::opentelemetry::{global, KeyValue};
+use qrt_log_utils::opentelemetry::metrics::{Counter, Histogram};
 use qrt_log_utils::tracing::{error, info, instrument};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::task::JoinHandle;
-use tracing::{info_span, warn};
-use tracing::log::trace;
+use tracing::{info_span, trace, warn};
 
 #[derive(Clone)]
 pub struct MongodbSaver {
@@ -281,7 +279,7 @@ impl MongodbSaver {
     fn get_save_document_cnt_counter() -> &'static Counter<u64> {
         SAVE_DOCUMENT_CNT_INSTANCE.get_or_init(|| {
             let meter = global::meter("msaver");
-            let histogram = meter.u64_counter("msaver-save-document-time").with_unit(Unit::new("ms")).init();
+            let histogram = meter.u64_counter("msaver-save-document-time").with_unit("ms").build();
             histogram
         })
     }
@@ -289,7 +287,7 @@ impl MongodbSaver {
     fn get_save_document_time_histogram() -> &'static Histogram<u64> {
         SAVE_DOCUMENT_TIME_INSTANCE.get_or_init(|| {
             let meter = global::meter("msaver");
-            let histogram = meter.u64_histogram("msaver-save-document-time").with_unit(Unit::new("ms")).init();
+            let histogram = meter.u64_histogram("msaver-save-document-time").with_unit("ms").build();
             histogram
         })
     }
@@ -301,7 +299,7 @@ impl MongodbSaver {
         if let Err(e) = find_result {
             return Err(e.into());
         }
-        let mut cursor = find_result.unwrap();
+        let mut cursor = find_result?;
         let next = cursor.next().await;
         match next {
             None => {
@@ -332,7 +330,7 @@ impl MongodbSaver {
         static WRITE_LOCAL_TIME_INSTANCE: OnceCell<Histogram<u64>> = OnceCell::new();
         let write_local_time = WRITE_LOCAL_TIME_INSTANCE.get_or_init(|| {
             let meter = global::meter("msaver");
-            let histogram = meter.u64_histogram("msaver-write-local-time-ms").with_unit(Unit::new("ms")).init();
+            let histogram = meter.u64_histogram("msaver-write-local-time-ms").with_unit("ms").build();
             histogram
         });
 
@@ -542,7 +540,7 @@ mod test {
     use std::env;
 
     use mongodb::bson::doc;
-    use qrt_log_utils::init_logger;
+    use qrt_log_utils::{init_logger, LoggerConfig};
     use serde::Serialize;
 
     use crate::mongodb_saver::MongodbSaver;
@@ -554,7 +552,7 @@ mod test {
 
     #[tokio::test]
     async fn test_sqlite() {
-        init_logger("msaver", None);
+        init_logger("msaver", LoggerConfig::default());
         let result = mongodb::bson::to_bson(&TestData { num: 1 }).unwrap();
         let now = chrono::Local::now();
         let document = doc! {"time":now, "data":&result};
