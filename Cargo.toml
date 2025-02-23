@@ -1,6 +1,6 @@
 [package]
 name = "msaver"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 keywords = ["config", "mongodb"]
@@ -18,7 +18,7 @@ rusqlite = { version = "0", features = ["bundled"] }
 serde_json = "1"
 tokio = { version = "1" }
 deadpool-sqlite = "0"
-qrt-log-utils = { path = "../qrt-log-utils", features = ["detect-host"] }
+qrt-log-utils = { version = "0.3", features = ["detect-host"] }
 once_cell = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros"] }
