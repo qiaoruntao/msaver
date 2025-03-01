@@ -4,8 +4,7 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use mongodb::bson::Document;
-use qrt_log_utils::opentelemetry::KeyValue;
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::Serialize;
 use tokio::task::JoinHandle;
 use tracing::{error, info_span, instrument, trace, warn};
@@ -29,7 +28,13 @@ pub struct Flusher {
 }
 
 impl Flusher {
-    pub fn create(collection_name: String, saver: Arc<MongodbSaver>, sqlite_connection: Arc<Mutex<Connection>>, max_len: usize, batch_len: usize) -> Flusher {
+    pub fn create(
+        collection_name: String,
+        saver: Arc<MongodbSaver>,
+        sqlite_connection: Arc<Mutex<Connection>>,
+        max_len: usize,
+        batch_len: usize,
+    ) -> Flusher {
         Flusher {
             collection_name,
             max_len,
@@ -77,11 +82,16 @@ impl Flusher {
                 let saver = self.saver.clone();
                 let collection_name = self.collection_name.clone();
                 let handle = tokio::spawn(async move {
-                    match saver.save_collection_batch(&collection_name, &batch_data_vec).await {
-                        Ok(_) => {
-                        }
+                    match saver
+                        .save_collection_batch(&collection_name, &batch_data_vec)
+                        .await
+                    {
+                        Ok(_) => {}
                         Err(e) => {
-                            error!("failed to flush to mongodb, collection is {} e={}",collection_name,e);
+                            error!(
+                                "failed to flush to mongodb, collection is {} e={}",
+                                collection_name, e
+                            );
                         }
                     }
                     trace!("completed");
@@ -89,20 +99,22 @@ impl Flusher {
                 *mutex_guard = Some(handle);
             }
         }
-        return if current_len >= self.max_len {
+        if current_len >= self.max_len {
             // queue full, write to local now
             // {
             //     let meter = global::meter("msaver");
             //     let counter = meter.u64_counter("msaver-direct-local-count").init();
             //     counter.add(1, &properties);
             // }
-            self.saver.write_local(&self.collection_name, &document).await
+            self.saver
+                .write_local(&self.collection_name, &document)
+                .await
         } else {
             trace!("push data to queue now");
             // write to queue now
             self.data_array.lock().unwrap().push(document);
             true
-        };
+        }
     }
 }
 
@@ -120,11 +132,13 @@ impl Drop for Flusher {
                 collection_name: self.collection_name.clone(),
                 data: serde_json::to_string(&doc).unwrap(),
             };
-            match self.sqlite_connection.lock().unwrap().execute("INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
-                                                                 params![&data.collection_name, &data.data]) {
+            match self.sqlite_connection.lock().unwrap().execute(
+                "INSERT INTO saved (collection_name, data) VALUES (?1, ?2)",
+                params![&data.collection_name, &data.data],
+            ) {
                 Ok(_) => {}
                 Err(e) => {
-                    error!("failed to insert data into local sqlite, e={}",e);
+                    error!("failed to insert data into local sqlite, e={}", e);
                     return;
                 }
             }
@@ -136,7 +150,7 @@ impl MongodbQueuedSaver {
     pub fn create(saver: MongodbSaver) -> Self {
         let sqlite_path = env::var("TempSqlitePath").unwrap_or("./sqlite_temp.sqlite".into());
         let sqlite_connection = match Connection::open(&sqlite_path) {
-            Ok(v) => { Arc::new(Mutex::new(v)) }
+            Ok(v) => Arc::new(Mutex::new(v)),
             Err(e) => {
                 panic!("failed to open sqlite database {}", e);
             }
@@ -156,30 +170,41 @@ impl MongodbQueuedSaver {
     }
 
     #[instrument(skip(self, obj))]
-    pub async fn save_collection<T: Serialize>(&self, collection_name: impl AsRef<str> + Debug, obj: &T) -> bool {
-        trace!("save into collection {}",collection_name.as_ref());
-        let document = match info_span!("serialize_part").in_scope(|| { mongodb::bson::to_document(obj) }) {
-            Ok(v) => { v }
+    pub async fn save_collection<T: Serialize>(
+        &self,
+        collection_name: impl AsRef<str> + Debug,
+        obj: &T,
+    ) -> bool {
+        trace!("save into collection {}", collection_name.as_ref());
+        let document = match info_span!("serialize_part").in_scope(|| bson::to_document(obj)) {
+            Ok(v) => v,
             Err(e) => {
-                error!("failed to serialize obj {}",e);
+                error!("failed to serialize obj {}", e);
                 return false;
             }
         };
         let batch = {
             let mut mutex_guard = self.queue.lock().unwrap();
             let collection_name = collection_name.as_ref().to_string();
-            let arc = mutex_guard.entry(collection_name.clone()).or_insert_with(|| {
-                trace!("init flush service now");
-                let flusher = Flusher::create(collection_name, self.saver.clone(), self.sqlite_connection.clone(), 5000, 100);
-                Arc::new(flusher)
-            });
+            let arc = mutex_guard
+                .entry(collection_name.clone())
+                .or_insert_with(|| {
+                    trace!("init flush service now");
+                    let flusher = Flusher::create(
+                        collection_name,
+                        self.saver.clone(),
+                        self.sqlite_connection.clone(),
+                        5000,
+                        100,
+                    );
+                    Arc::new(flusher)
+                });
             arc.clone()
         };
 
         batch.add_data(document).await
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -188,15 +213,9 @@ mod test {
 
     use mongodb::bson::doc;
     use qrt_log_utils::{init_logger, LoggerConfig};
-    use serde::Serialize;
 
     use crate::mongodb_queued_saver::MongodbQueuedSaver;
     use crate::mongodb_saver::MongodbSaver;
-
-    #[derive(Serialize)]
-    struct TestData {
-        num: i32,
-    }
 
     #[tokio::test]
     async fn test_bunk() {
@@ -205,13 +224,17 @@ mod test {
         let queued_saver = MongodbQueuedSaver::create(mongodb_saver);
         for index in 0..10 {
             let now = chrono::Local::now();
-            let result = queued_saver.save_collection("aaa", &doc! {"time":now, "data":&index}).await;
+            let result = queued_saver
+                .save_collection("aaa", &doc! {"time":now, "data":&index})
+                .await;
             assert!(result, "failed to insert value")
         }
         for _ in 0..10 {
             for index in 0..100 {
                 let now = chrono::Local::now();
-                let result = queued_saver.save_collection("aaa", &doc! {"time":now, "data":&index}).await;
+                let result = queued_saver
+                    .save_collection("aaa", &doc! {"time":now, "data":&index})
+                    .await;
                 assert!(result, "failed to insert value")
             }
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -229,7 +252,9 @@ mod test {
         let queued_saver = MongodbQueuedSaver::create(mongodb_saver);
         for index in 0..100 {
             let now = chrono::Local::now();
-            let result = queued_saver.save_collection("aaa", &doc! {"time":now, "data":&index}).await;
+            let result = queued_saver
+                .save_collection("aaa", &doc! {"time":now, "data":&index})
+                .await;
             assert!(result, "failed to insert value")
         }
         // drop(queued_saver);
